@@ -1,0 +1,163 @@
+import numpy as np
+import time
+import matplotlib.pyplot as plt
+import sys
+import matplotlib.animation as animation
+
+
+class heating_system():
+    def __init__(self,timesteps,time,initial_system_temp,spatial_steps,minutes=True,seconds=False):
+        self.t0 = initial_system_temp
+        self.timesteps = timesteps
+        self.height = 1 #height of the pipe/tank in meters
+        self.pipe_r1 = 0.05 # meters
+        self.pipe_r2 = 0.050889 # meters
+        self.cu_density = 8960 #kg/m^3
+        if seconds and minutes:
+            sys.exit("Seconds and minutes can not both be true")
+        if seconds:
+            self.panel_power = 290 # Watts
+        if minutes:
+            self.panel_power = 17400 # Joules/minute
+        self.num_pts = spatial_steps
+        self.nx = int((self.num_pts/10) + 2)
+        self.ny = self.num_pts
+        self.dt = time/timesteps
+        self.dy = self.height/self.ny
+        self.dx = self.dy
+        self.pipe_water_in_out = int(0.1/self.dy) # length of input/output pipes put into a discrete number of points
+        self.alpha = 0.14 # Assuming a constant thermal diffusivity of water
+        self.r_pipe = self.alpha*self.dt/((self.dx**2)*(self.dy**2))
+        self.r_tank = self.alpha*self.dt/(self.dy**2)
+        if self.r_pipe*self.dx**2 > 0.5 or self.r_pipe*self.dy**2 > 0.5 or self.r_tank > 0.25:
+            print("One of the values for r is too large.")
+            print("ry_pipe =",self.r_pipe*self.dx**2)
+            print("rx_pipe =",self.r_pipe*self.dy**2)
+            print("r_tank =",self.r_tank)
+            sys.exit("Pick enough points for x, y, and t such that r <= 0.25")
+        else:
+            print("ry_pipe =",self.r_pipe*self.dx**2)
+            print("rx_pipe =",self.r_pipe*self.dy**2)
+            print("r_tank =",self.r_tank)
+        self.heater_volume = np.pi*(self.height*self.pipe_r1**2)
+        self.cu_volume = np.pi*(self.height*((self.pipe_r2**2)-(self.pipe_r1**2)))
+        self.cu_mass = self.cu_volume*self.cu_density
+        self.cu_cp = 385 # specific heat of copper in J/(kg*K)
+
+    def _heater(self,time,power,T_i):
+        T_f = float((power*time)/(self.cu_mass*self.cu_cp))+T_i
+        if T_f >= 330:
+            return T_i
+        else:
+            return T_f
+
+    def create_matrix(self,nx,ny,r,t0,dx,dy,tank=False):
+        heat_vector = np.zeros((nx*ny))
+        heat_vector.fill(t0)
+        heat_matrix = np.zeros((nx*ny,nx*ny))
+        outer_points = []
+        if tank:
+            dy = 1
+            dx = 1
+        for i in range(len(heat_matrix)):
+            if i<=nx or i>=len(heat_matrix)-nx-1:
+                heat_matrix[i,i] = 1
+                heat_vector[i] = t0
+                outer_points.append(i)
+            if i>nx and i<len(heat_matrix)-nx-1:
+                if (i+1)%nx==0 or (i)%nx==0:
+                    heat_matrix[i,i]=1
+                    heat_vector[i] = t0
+                    outer_points.append(i)
+                else:
+                    heat_matrix[i,i] = 1-2*r*dx**2-2*r*dy**2
+                    if i<=(nx*ny)-nx:
+                        heat_matrix[i,i+nx] = r*dy**2
+                    if i>=nx:
+                        heat_matrix[i,i-nx] = r*dy**2
+                    if i!=0:
+                        heat_matrix[i,i-1] = r*dx**2
+                    if i<(nx*ny)-1:
+                        heat_matrix[i,i+1] = r*dx**2
+        if tank:
+            tank_heat_out = []
+            tank_heat_in = []
+            for k in range(self.pipe_water_in_out):
+                tank_heat_in.append((k+1)*ny)
+            for k in range(self.pipe_water_in_out):
+                tank_heat_out.append(ny*(ny-2-k))
+
+            return outer_points,tank_heat_in,tank_heat_out,heat_matrix,heat_vector
+        else:
+            pipe_heat_out = []
+            pipe_heat_in = []       
+            for k in range(self.pipe_water_in_out):
+                pipe_heat_out.append(nx*(2+k)-1)
+            for k in range(self.pipe_water_in_out):
+                pipe_heat_in.append(nx*(ny-k-1)-1)
+            return outer_points,pipe_heat_in,pipe_heat_out,heat_matrix,heat_vector
+
+    def _animate(self,i):
+        ax = self.ax
+        ax.clear()
+        ax.contourf(self.plot[i,:,:],levels=100,cmap='coolwarm')
+        ax.set_title('%03d'%(i))
+
+    def calculate_heat(self,timesteps,contour_interval):
+        heater_points,pipe_heat_in,pipe_heat_out,pipe_heat_matrix,pipe_heat_vector = self.create_matrix(self.nx,self.ny,self.r_pipe,self.t0,self.dx,self.dy)
+        insulation_points,tank_heat_in,tank_heat_out,tank_heat_matrix,tank_heat_vector = self.create_matrix(self.ny,self.ny,self.r_tank,self.t0,self.dy,self.dy,tank=True)
+        ny = self.ny
+        start = time.time()
+        self.plot = np.zeros((int(timesteps/contour_interval),self.ny,self.ny))
+        pipe = np.matmul(pipe_heat_matrix,pipe_heat_vector)
+        m = 0
+        for i in pipe_heat_out:
+            tank_heat_vector[tank_heat_in[m]] = pipe[i]
+            m+=1
+        m = 0
+        tank = np.matmul(tank_heat_matrix,tank_heat_vector)
+        for i in tank_heat_out:
+            pipe[pipe_heat_in[m]] = tank[i]
+        k = 0
+        for i in range(timesteps):
+            for j in heater_points:
+                pipe[j] = self._heater((self.dt),self.panel_power,pipe[j])
+            for n in insulation_points:
+                if n<ny:
+                    tank[n] = tank[n+ny]
+                if n>(ny**2)-ny-1:
+                    tank[n] = tank[n-ny]
+                if n>=ny and n<=(ny**2)-ny-1 and n not in tank_heat_in:
+                    if (n+1)%ny==0:
+                        tank[n] = tank[n-1]
+                    if (n)%ny==0:
+                        tank[n] = tank[n+1]
+            pipe = np.matmul(pipe_heat_matrix,pipe)
+            m = 0
+            for p in pipe_heat_out:
+                tank[tank_heat_in[m]] = pipe[p]
+                m+=1
+            m = 0
+            tank = np.matmul(tank_heat_matrix,tank)
+            for p in tank_heat_out:
+                pipe[pipe_heat_in[m]] = tank[p]
+            tank_matrix = np.reshape(tank,[ny,ny])               
+            if i%contour_interval==0:
+                self.plot[k,:,:] = tank_matrix
+                k+=1
+        print("The final temperature matrix is")
+        print(self.plot[-1:,:,:])
+        print("The simulation took:",time.time()-start,"seconds")
+        return self.plot
+    def _plot_result(self):
+        fig,self.ax = plt.subplots()
+        interval = 0.001 # frame time in seconds
+        self.ani = animation.FuncAnimation(fig,self._animate,self.timesteps,interval=interval*1e+3,blit=False)
+        plt.show()
+    def _save_animation(self):
+        writer = animation.ImageMagickFileWriter(fps=15)
+        self.ani.save('heat.mp4',writer=writer)
+test = heating_system(timesteps=40000,time=100,initial_system_temp=285,spatial_steps=20)
+plot = test.calculate_heat(timesteps=40000,contour_interval=10)
+test._plot_result()
+#test._save_animation()
